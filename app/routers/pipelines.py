@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Query
 import httpx
 import logging
+import os
 
 router = APIRouter(tags=["pipelines"])
 logger = logging.getLogger(__name__)
 
 GITHUB_OWNER = "sreenidhipalimar98"
-# Repos that have CI/CD workflows
 CI_REPOS = ["cloudpulse-api", "CloudPulse-Terraform"]
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 STATUS_MAP = {
     "completed": "healthy",
@@ -20,6 +21,16 @@ STATUS_MAP = {
 }
 
 
+def _github_headers():
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "CloudPulse-API",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
+
 @router.get("/")
 def list_pipelines(limit: int = Query(default=15, le=30)):
     """Fetch recent GitHub Actions workflow runs across CI/CD repos."""
@@ -29,7 +40,7 @@ def list_pipelines(limit: int = Query(default=15, le=30)):
         try:
             url = f"https://api.github.com/repos/{GITHUB_OWNER}/{repo}/actions/runs"
             params = {"per_page": limit, "branch": "develop"}
-            resp = httpx.get(url, params=params, timeout=10)
+            resp = httpx.get(url, params=params, headers=_github_headers(), timeout=10)
 
             if resp.status_code == 200:
                 for run in resp.json().get("workflow_runs", []):
@@ -51,13 +62,11 @@ def list_pipelines(limit: int = Query(default=15, le=30)):
         except Exception as e:
             logger.warning(f"Could not fetch workflow runs for {repo}: {e}")
 
-    # Sort by start time descending
     all_runs.sort(key=lambda x: x.get("started_at") or "", reverse=True)
     return {"pipelines": all_runs[:limit]}
 
 
 def _calc_duration(run):
-    """Calculate run duration in seconds if completed."""
     try:
         if run.get("updated_at") and run.get("run_started_at"):
             from datetime import datetime
