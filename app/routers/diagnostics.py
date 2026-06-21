@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 import boto3
 import logging
 from datetime import datetime, timedelta
@@ -7,13 +7,15 @@ from app.core.config import settings
 router = APIRouter(tags=["diagnostics"])
 logger = logging.getLogger(__name__)
 
+LOG_GROUP = "/ecs/cloudpulse-dev"
+
 
 @router.get("/ecs/{service_name}")
 def diagnose_ecs_service(service_name: str):
     """Get diagnostics for an ECS service: recent events, stopped tasks, and error logs."""
     try:
         ecs = boto3.client("ecs", region_name=settings.aws_region)
-        logs = boto3.client("logs", region_name=settings.aws_region)
+        logs_client = boto3.client("logs", region_name=settings.aws_region)
 
         # Find the cluster
         clusters = ecs.list_clusters().get("clusterArns", [])
@@ -31,7 +33,7 @@ def diagnose_ecs_service(service_name: str):
                 continue
 
         if not service_detail:
-            return {"error": f"Service '{service_name}' not found", "events": [], "stopped_tasks": [], "recent_errors": []}
+            return {"error": f"Service '{service_name}' not found", "events": [], "stopped_tasks": [], "recent_errors": [], "recent_logs": []}
 
         # 1. Recent service events (deployments, task failures)
         events = []
@@ -61,29 +63,11 @@ def diagnose_ecs_service(service_name: str):
                     "exit_code": _get_exit_code(task),
                 })
 
-        # 3. Recent error logs from CloudWatch
-        recent_errors = []
-        log_group = f"/ecs/cloudpulse-{settings.app_env if hasattr(settings, 'app_env') else 'dev'}"
-        try:
-            now = int(datetime.utcnow().timestamp() * 1000)
-            one_hour_ago = int((datetime.utcnow() - timedelta(hours=1)).timestamp() * 1000)
+        # 3. Recent error logs (filtered for errors/exceptions)
+        recent_errors = _fetch_logs(logs_client, LOG_GROUP, filter_pattern="?ERROR ?error ?Exception ?Traceback ?CRITICAL ?500", limit=30)
 
-            log_resp = logs.filter_log_events(
-                logGroupName=log_group,
-                startTime=one_hour_ago,
-                endTime=now,
-                filterPattern="?ERROR ?error ?Error ?Exception ?Traceback ?CRITICAL",
-                limit=20,
-            )
-
-            for event in log_resp.get("events", []):
-                recent_errors.append({
-                    "timestamp": datetime.fromtimestamp(event["timestamp"] / 1000).isoformat(),
-                    "message": event["message"].strip(),
-                    "stream": event.get("logStreamName", ""),
-                })
-        except Exception as e:
-            logger.warning(f"Could not fetch logs: {e}")
+        # 4. Recent application logs (last 50 lines, unfiltered — the actual API output)
+        recent_logs = _fetch_logs(logs_client, LOG_GROUP, filter_pattern=None, limit=50)
 
         return {
             "service_name": service_name,
@@ -93,11 +77,24 @@ def diagnose_ecs_service(service_name: str):
             "events": events,
             "stopped_tasks": stopped_tasks,
             "recent_errors": recent_errors,
+            "recent_logs": recent_logs,
         }
 
     except Exception as e:
         logger.error(f"ECS diagnostics failed: {e}")
-        return {"error": str(e), "events": [], "stopped_tasks": [], "recent_errors": []}
+        return {"error": str(e), "events": [], "stopped_tasks": [], "recent_errors": [], "recent_logs": []}
+
+
+@router.get("/ecs/{service_name}/logs")
+def get_ecs_logs(service_name: str, minutes: int = Query(default=30, le=360), filter: str = Query(default=None)):
+    """Get raw application logs for an ECS service. Optional filter pattern."""
+    try:
+        logs_client = boto3.client("logs", region_name=settings.aws_region)
+        results = _fetch_logs(logs_client, LOG_GROUP, filter_pattern=filter, limit=100, minutes_back=minutes)
+        return {"logs": results, "log_group": LOG_GROUP, "minutes": minutes, "filter": filter}
+    except Exception as e:
+        logger.error(f"Log fetch failed: {e}")
+        return {"logs": [], "error": str(e)}
 
 
 @router.get("/rds/{instance_id}")
@@ -111,7 +108,7 @@ def diagnose_rds_instance(instance_id: str):
         events_resp = rds.describe_events(
             SourceIdentifier=instance_id,
             SourceType="db-instance",
-            Duration=1440,  # last 24 hours in minutes
+            Duration=1440,
         )
 
         events = []
@@ -155,6 +152,45 @@ def diagnose_rds_instance(instance_id: str):
     except Exception as e:
         logger.error(f"RDS diagnostics failed: {e}")
         return {"error": str(e), "events": [], "metrics": {}}
+
+
+def _fetch_logs(logs_client, log_group, filter_pattern=None, limit=50, minutes_back=60):
+    """Fetch recent logs from CloudWatch, optionally filtered."""
+    try:
+        now = int(datetime.utcnow().timestamp() * 1000)
+        start = int((datetime.utcnow() - timedelta(minutes=minutes_back)).timestamp() * 1000)
+
+        kwargs = {
+            "logGroupName": log_group,
+            "startTime": start,
+            "endTime": now,
+            "limit": limit,
+            "interleaved": True,
+        }
+        if filter_pattern:
+            kwargs["filterPattern"] = filter_pattern
+
+        log_resp = logs_client.filter_log_events(**kwargs)
+
+        results = []
+        for event in log_resp.get("events", []):
+            msg = event["message"].strip()
+            level = "info"
+            if any(kw in msg for kw in ["ERROR", "CRITICAL", "Traceback", "Exception"]):
+                level = "error"
+            elif any(kw in msg for kw in ["WARNING", "WARN"]):
+                level = "warning"
+
+            results.append({
+                "timestamp": datetime.fromtimestamp(event["timestamp"] / 1000).isoformat(),
+                "message": msg,
+                "level": level,
+                "stream": event.get("logStreamName", ""),
+            })
+        return results
+    except Exception as e:
+        logger.warning(f"Could not fetch logs from {log_group}: {e}")
+        return []
 
 
 def _get_exit_code(task):
