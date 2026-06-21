@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import health, infrastructure, alerts, pipelines, costs
+from app.routers import health, infrastructure, alerts, pipelines, costs, diagnostics
 
 app = FastAPI(
     title="CloudPulse API",
@@ -22,3 +22,4 @@ app.include_router(infrastructure.router, prefix="/infrastructure")
 app.include_router(pipelines.router, prefix="/pipelines")
 app.include_router(alerts.router, prefix="/alerts")
 app.include_router(costs.router, prefix="/costs")
+app.include_router(diagnostics.router, prefix="/diagnostics")
