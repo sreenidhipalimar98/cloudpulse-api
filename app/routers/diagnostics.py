@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 
 LOG_GROUP = "/ecs/cloudpulse-dev"
 
+# CloudWatch filter pattern: match lines containing ERROR, Exception, Traceback, or CRITICAL
+# Removed "?500" which was falsely matching port numbers in INFO logs
+ERROR_FILTER = "?ERROR ?Exception ?Traceback ?CRITICAL ?\"500 Internal\""
+
 
 @router.get("/ecs/{service_name}")
 def diagnose_ecs_service(service_name: str):
@@ -63,10 +67,15 @@ def diagnose_ecs_service(service_name: str):
                     "exit_code": _get_exit_code(task),
                 })
 
-        # 3. Recent error logs (filtered for errors/exceptions)
-        recent_errors = _fetch_logs(logs_client, LOG_GROUP, filter_pattern="?ERROR ?error ?Exception ?Traceback ?CRITICAL ?500", limit=30)
+        # 3. Recent error logs only (filtered — real errors, not INFO lines)
+        recent_errors = _fetch_logs(logs_client, LOG_GROUP, filter_pattern=ERROR_FILTER, limit=30)
+        # Post-filter: remove any line that's clearly an INFO 200 OK response
+        recent_errors = [
+            log for log in recent_errors
+            if not ('" 200 OK' in log["message"] or "INFO:" in log["message"])
+        ]
 
-        # 4. Recent application logs (last 50 lines, unfiltered — the actual API output)
+        # 4. Recent application logs (last 50 lines, unfiltered — full API output)
         recent_logs = _fetch_logs(logs_client, LOG_GROUP, filter_pattern=None, limit=50)
 
         return {
@@ -176,7 +185,7 @@ def _fetch_logs(logs_client, log_group, filter_pattern=None, limit=50, minutes_b
         for event in log_resp.get("events", []):
             msg = event["message"].strip()
             level = "info"
-            if any(kw in msg for kw in ["ERROR", "CRITICAL", "Traceback", "Exception"]):
+            if any(kw in msg for kw in ["ERROR", "CRITICAL", "Traceback", "Exception", "500 Internal"]):
                 level = "error"
             elif any(kw in msg for kw in ["WARNING", "WARN"]):
                 level = "warning"
