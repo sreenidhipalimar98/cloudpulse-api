@@ -1,20 +1,52 @@
-from unittest.mock import patch, MagicMock
-from fastapi.testclient import TestClient
+"""Tests for /infrastructure endpoints."""
 
 
-def test_list_ec2_instances_returns_200():
-    with patch("app.services.aws_client.boto3.client") as mock_boto:
-        mock_instance = MagicMock()
-        mock_boto.return_value = mock_instance
-        mock_instance.describe_instances.return_value = {
-            "Reservations": [
-                {"Instances": [{"InstanceId": "i-123", "State": {"Name": "running"}, "InstanceType": "t3.micro"}]}
-            ]
-        }
-        mock_instance.list_clusters.return_value = {"clusterArns": []}
-        mock_instance.describe_db_instances.return_value = {"DBInstances": []}
-
-        from app.main import app
-        client = TestClient(app)
-        response = client.get("/infrastructure/ec2")
+def test_ec2_returns_instances(client):
+    response = client.get("/infrastructure/ec2")
     assert response.status_code == 200
+    data = response.json()
+    assert "instances" in data
+    assert len(data["instances"]) == 1
+    assert data["instances"][0]["id"] == "i-abc123"
+    assert data["instances"][0]["status"] == "healthy"
+
+
+def test_ec2_returns_empty_when_no_instances(client, mock_boto):
+    mock_boto.describe_instances.return_value = {"Reservations": []}
+    response = client.get("/infrastructure/ec2")
+    assert response.status_code == 200
+    assert response.json() == {"instances": []}
+
+
+def test_ecs_returns_services(client):
+    response = client.get("/infrastructure/ecs")
+    assert response.status_code == 200
+    data = response.json()
+    assert "services" in data
+    assert len(data["services"]) == 1
+    assert data["services"][0]["name"] == "test-svc"
+    assert data["services"][0]["status"] == "healthy"
+
+
+def test_ecs_returns_empty_when_no_clusters(client, mock_boto):
+    mock_boto.list_clusters.return_value = {"clusterArns": []}
+    response = client.get("/infrastructure/ecs")
+    assert response.status_code == 200
+    assert response.json() == {"services": []}
+
+
+def test_rds_returns_instances(client):
+    response = client.get("/infrastructure/rds")
+    assert response.status_code == 200
+    data = response.json()
+    assert "instances" in data
+    assert len(data["instances"]) == 1
+    assert data["instances"][0]["id"] == "test-db"
+    assert data["instances"][0]["status"] == "healthy"
+
+
+def test_rds_returns_empty_when_no_instances(client, mock_boto):
+    mock_boto.describe_db_instances.return_value = {"DBInstances": []}
+    response = client.get("/infrastructure/rds")
+    assert response.status_code == 200
+    assert response.json() == {"instances": []}
